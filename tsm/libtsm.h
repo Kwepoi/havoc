@@ -128,6 +128,10 @@ struct tsm_screen_attr {
 	unsigned int inverse : 1;	/* inverse colors */
 	unsigned int protect : 1;	/* cannot be erased */
 	unsigned int blink : 1;		/* blinking character */
+	unsigned int image : 1;		/* cell is part of an image */
+	uint32_t image_id;		/* ID of the image */
+	uint16_t image_x;		/* x-offset into image in cells */
+	uint16_t image_y;		/* y-offset into image in cells */
 };
 
 typedef void (*tsm_screen_draw_cb) (struct tsm_screen *con,
@@ -201,6 +205,8 @@ void tsm_screen_erase_screen_to_cursor(struct tsm_screen *con, bool protect);
 void tsm_screen_erase_cursor_to_screen(struct tsm_screen *con, bool protect);
 void tsm_screen_erase_screen(struct tsm_screen *con, bool protect);
 
+void tsm_screen_draw_image(struct tsm_screen *con, uint32_t id, int w, int h);
+
 enum tsm_screen_selection_mode {
 	TSM_SM_CHAR,
 	TSM_SM_WORD,
@@ -254,9 +260,14 @@ typedef void (*tsm_vte_write_cb) (struct tsm_vte *vte,
 				  const char *u8,
 				  size_t len,
 				  void *data);
+typedef void (*tsm_vte_osc_cb) (struct tsm_vte *vte,
+				const char *osc,
+				size_t len,
+				void *data);
 
 int tsm_vte_new(struct tsm_vte **out, struct tsm_screen *con,
-		tsm_vte_write_cb write_cb, void *data);
+		tsm_vte_write_cb write_cb,
+		tsm_vte_osc_cb osc_cb, void *data);
 void tsm_vte_ref(struct tsm_vte *vte);
 void tsm_vte_unref(struct tsm_vte *vte);
 

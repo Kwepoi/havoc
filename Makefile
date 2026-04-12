@@ -7,7 +7,7 @@ PKG_CONFIG ?= pkg-config
 WAYLAND_SCANNER ?= wayland-scanner
 
 CFLAGS ?= -g -O2
-CDEFS = -DVERSION='$(VERSION)' -D_XOPEN_SOURCE=700
+CDEFS = -DVERSION='$(VERSION)' -D_XOPEN_SOURCE=700 -D_GNU_SOURCE
 
 WAYLAND_PROTOCOLS_DIR != $(PKG_CONFIG) --variable=pkgdatadir wayland-protocols
 

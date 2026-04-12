@@ -151,6 +151,7 @@ struct tsm_vte {
 	unsigned long ref;
 	struct tsm_screen *con;
 	tsm_vte_write_cb write_cb;
+	tsm_vte_osc_cb osc_cb;
 	void *data;
 	char *palette_name;
 
@@ -162,6 +163,10 @@ struct tsm_vte {
 	int csi_argc;
 	int csi_argv[CSI_ARG_MAX];
 	unsigned int csi_flags;
+
+	char *osc_buf;
+	size_t osc_len;
+	size_t osc_alloc;
 
 	uint8_t (*palette)[3];
 	struct tsm_screen_attr def_attr;
@@ -263,7 +268,8 @@ static void copy_bcolor(struct tsm_screen_attr *dest,
 
 SHL_EXPORT
 int tsm_vte_new(struct tsm_vte **out, struct tsm_screen *con,
-		tsm_vte_write_cb write_cb, void *data)
+		tsm_vte_write_cb write_cb,
+		tsm_vte_osc_cb osc_cb, void *data)
 {
 	struct tsm_vte *vte;
 	int ret;
@@ -276,6 +282,7 @@ int tsm_vte_new(struct tsm_vte **out, struct tsm_screen *con,
 	vte->ref = 1;
 	vte->con = con;
 	vte->write_cb = write_cb;
+	vte->osc_cb = osc_cb;
 	vte->data = data;
 	vte->palette = default_palette;
 	vte->def_attr.fccode = TSM_COLOR_FOREGROUND;
@@ -312,6 +319,7 @@ void tsm_vte_unref(struct tsm_vte *vte)
 
 	tsm_screen_unref(vte->con);
 	tsm_utf8_mach_free(vte->mach);
+	free(vte->osc_buf);
 	free(vte);
 }
 
@@ -717,6 +725,34 @@ static void do_collect(struct tsm_vte *vte, uint32_t data)
 		vte->csi_flags |= CSI_PCLOSE;
 		break;
 	}
+}
+
+static void do_osc_start(struct tsm_vte *vte)
+{
+	vte->osc_len = 0;
+	if (vte->osc_buf)
+		vte->osc_buf[0] = 0;
+}
+
+static void do_osc_collect(struct tsm_vte *vte, uint32_t data)
+{
+	if (vte->osc_len + 1 >= vte->osc_alloc) {
+		size_t new_alloc = vte->osc_alloc ? vte->osc_alloc * 2 : 256;
+		char *new_buf = realloc(vte->osc_buf, new_alloc);
+		if (!new_buf)
+			return;
+		vte->osc_buf = new_buf;
+		vte->osc_alloc = new_alloc;
+	}
+
+	vte->osc_buf[vte->osc_len++] = data;
+	vte->osc_buf[vte->osc_len] = 0;
+}
+
+static void do_osc_end(struct tsm_vte *vte)
+{
+	if (vte->osc_cb)
+		vte->osc_cb(vte, vte->osc_buf, vte->osc_len, vte->data);
 }
 
 static void do_param(struct tsm_vte *vte, uint32_t data)
@@ -1761,10 +1797,13 @@ static void do_action(struct tsm_vte *vte, uint32_t data, int action)
 		case ACTION_DCS_END:
 			break;
 		case ACTION_OSC_START:
+			do_osc_start(vte);
 			break;
 		case ACTION_OSC_COLLECT:
+			do_osc_collect(vte, data);
 			break;
 		case ACTION_OSC_END:
+			do_osc_end(vte);
 			break;
 		default:
 			llog_warning(vte, "invalid action %d", action);
@@ -2122,17 +2161,17 @@ static void parse_data(struct tsm_vte *vte, uint32_t raw)
 		case 0x08 ... 0x17:
 		case 0x19:
 		case 0x1c ... 0x1f:
-			do_trans(vte, raw, STATE_NONE, ACTION_IGNORE);
+			do_action(vte, raw, ACTION_IGNORE);
 			return;
 		case 0x20 ... 0x7f:
-			do_trans(vte, raw, STATE_NONE, ACTION_OSC_COLLECT);
+			do_action(vte, raw, ACTION_OSC_COLLECT);
 			return;
 		case 0x07:
 		case 0x9c:
 			do_trans(vte, raw, STATE_GROUND, ACTION_NONE);
 			return;
 		}
-		do_trans(vte, raw, STATE_NONE, ACTION_OSC_COLLECT);
+		do_action(vte, raw, ACTION_OSC_COLLECT);
 		return;
 	case STATE_ST_IGNORE:
 		switch (raw) {

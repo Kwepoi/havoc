@@ -1562,3 +1562,28 @@ void tsm_screen_erase_screen(struct tsm_screen *con, bool protect)
 			     protect);
 	con->vanguard = 0;
 }
+
+SHL_EXPORT
+void tsm_screen_draw_image(struct tsm_screen *con, uint32_t id, int w, int h)
+{
+	struct tsm_screen_attr attr;
+	int x, y, start_x;
+
+	memcpy(&attr, &con->def_attr, sizeof(attr));
+	attr.image = 1;
+	attr.image_id = id;
+
+	start_x = con->cursor_x;
+
+	for (y = 0; y < h; ++y) {
+		for (x = 0; x < w; ++x) {
+			attr.image_x = (uint16_t)x;
+			attr.image_y = (uint16_t)y;
+			tsm_screen_write(con, ' ', &attr);
+		}
+		if (y < h - 1) {
+			tsm_screen_newline(con);
+			tsm_screen_move_to(con, start_x, con->cursor_y);
+		}
+	}
+}
