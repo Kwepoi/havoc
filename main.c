@@ -286,7 +286,7 @@ typedef uint8_t u8;
 typedef uint32_t u32;
 
 #define mul(a, b) (((u32)(a) * (u32)(b) + 255) >> 8)
-#define join(a, r, g, b)                                                       \
+#define join(a, r, g, b) \
     ((u32)(a) << 24 | (u32)(r) << 16 | (u32)(g) << 8 | (u32)(b))
 
 static void free_image_at_index(int index) {
@@ -331,17 +331,28 @@ static void osc_cb(struct tsm_vte *vte, const char *osc, size_t len,
                         if (pixels) {
                             uint32_t id = term.next_image_id++;
 
-                            // Enforce 1 image at a time limit
-                            if (term.num_images > 0) {
-                                free_image_at_index(0);
-                            } else {
-                                term.images = malloc(sizeof(struct image));
-                                if (!term.images) {
-                                    stbi_image_free(pixels);
-                                    free(img_data);
-                                    return;
+                            const int max_images = 12;
+                            int target_idx = -1;
+
+                            if (term.num_images < max_images) {
+                                void *tmp = realloc(term.images,
+                                (term.num_images + 1) * sizeof(struct image));
+                                if (tmp) {
+                                    term.images = tmp;
+                                    target_idx = term.num_images++;
                                 }
-                                term.num_images = 1;
+                            } else {
+                                /* Reuse the oldest slot (0) and shift others */
+                                free_image_at_index(0);
+                                memmove(&term.images[0], &term.images[1],
+                                (max_images - 1) * sizeof(struct image));
+                                target_idx = max_images - 1;
+                            }
+
+                            if (target_idx < 0) {
+                                stbi_image_free(pixels);
+                                free(img_data);
+                                return;
                             }
 
                             int target_w = w;
@@ -379,51 +390,19 @@ static void osc_cb(struct tsm_vte *vte, const char *osc, size_t len,
                                     pixels, w, h, 0, resized, target_w,
                                     target_h, 0, STBIR_RGBA);
 
-                                uint32_t *final_pixels = malloc(
-                                    target_w * target_h * sizeof(uint32_t));
-                                uint8_t *bg =
-                                    term.cfg.colors[TSM_COLOR_BACKGROUND];
-                                uint8_t ba = term.cfg.opacity;
-
-                                for (int i = 0; i < target_w * target_h; i++) {
-                                    uint8_t r = resized[i * 4 + 0];
-                                    uint8_t g = resized[i * 4 + 1];
-                                    uint8_t b = resized[i * 4 + 2];
-                                    uint8_t a = resized[i * 4 + 3];
-
-                                    uint8_t final_a = mul(a, ba);
-                                    uint8_t inv_a = 255 - final_a;
-
-                                    uint8_t bg_r = mul(bg[0], ba);
-                                    uint8_t bg_g = mul(bg[1], ba);
-                                    uint8_t bg_b = mul(bg[2], ba);
-
-                                    uint32_t out_a = final_a + mul(ba, inv_a);
-                                    uint32_t out_r =
-                                        mul(r, final_a) + mul(bg_r, inv_a);
-                                    uint32_t out_g =
-                                        mul(g, final_a) + mul(bg_g, inv_a);
-                                    uint32_t out_b =
-                                        mul(b, final_a) + mul(bg_b, inv_a);
-
-                                    final_pixels[i] =
-                                        join(out_a, out_r, out_g, out_b);
-                                }
-
-                                term.images[0].id = id;
-                                term.images[0].w = target_w;
-                                term.images[0].h = target_h;
-                                term.images[0].cols = cols;
-                                term.images[0].rows = rows;
-                                term.images[0].data = final_pixels;
+                                term.images[target_idx].id = id;
+                                term.images[target_idx].w = target_w;
+                                term.images[target_idx].h = target_h;
+                                term.images[target_idx].cols = cols;
+                                term.images[target_idx].rows = rows;
+                                term.images[target_idx].data = (
+                                        uint32_t *)resized;
 
                                 tsm_screen_draw_image(term.screen, id, cols,
                                                       rows);
                                 term.buf[0].age = 0;
                                 term.buf[1].age = 0;
                                 term.need_redraw = true;
-
-                                free(resized);
                             }
                             stbi_image_free(pixels);
                         }
@@ -875,7 +854,7 @@ static void draw_cell(struct tsm_screen *tsm, uint32_t id, const uint32_t *ch,
     if (a->image) {
         int i;
         struct image *img = NULL;
-        for (i = 0; i < term.num_images; i++) {
+        for (i = term.num_images - 1; i >= 0; i--) {
             if (term.images[i].id == a->image_id) {
                 img = &term.images[i];
                 break;
@@ -896,24 +875,45 @@ static void draw_cell(struct tsm_screen *tsm, uint32_t id, const uint32_t *ch,
             for (iy = 0; iy < h; iy++) {
                 int pixel_y = a->image_y * term.cheight + iy;
 
-                // If the entire row is within the vertical bounds of the image
                 if (pixel_y >= 0 && pixel_y < img->h) {
-                    int base_idx = pixel_y * img->w; // Hoisted multiplication!
+                    uint32_t *src_row = img->data + (pixel_y * img->w);
                     for (ix = 0; ix < w; ix++) {
                         int pixel_x = a->image_x * term.cwidth + ix;
 
                         if (pixel_x >= 0 && pixel_x < img->w) {
-                            dst[ix] = img->data[base_idx + pixel_x];
+                            uint32_t raw = src_row[pixel_x];
+                            u8 r = (raw >> 0) & 0xff;
+                            u8 g = (raw >> 8) & 0xff;
+                            u8 b = (raw >> 16) & 0xff;
+                            u8 a_val = (raw >> 24) & 0xff;
+
+                            if (a_val == 255 && ba == 255) {
+                                dst[ix] = join(255, r, g, b);
+                            } else {
+                                uint8_t final_a = mul(a_val, ba);
+                                uint8_t inv_a = 255 - final_a;
+
+                                uint8_t bg_r = mul(br, ba);
+                                uint8_t bg_g = mul(bg, ba);
+                                uint8_t bg_b = mul(bb, ba);
+
+                                uint32_t out_a = final_a + mul(ba, inv_a);
+                                uint32_t out_r = mul(r, final_a)
+                                    + mul(bg_r, inv_a);
+                                uint32_t out_g = mul(g, final_a)
+                                    + mul(bg_g, inv_a);
+                                uint32_t out_b = mul(b, final_a)
+                                    + mul(bg_b, inv_a);
+
+                                dst[ix] = join(out_a, out_r, out_g, out_b);
+                            }
                         } else {
                             dst[ix] = bg_p;
                         }
                     }
                 } else {
-                    // Fast path: Entire row is out of bounds, just paint
-                    // background
-                    for (ix = 0; ix < w; ix++) {
+                    for (ix = 0; ix < w; ix++)
                         dst[ix] = bg_p;
-                    }
                 }
                 dst += term.width;
             }
