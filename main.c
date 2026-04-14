@@ -14,6 +14,7 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
+#include <malloc.h>
 
 #include <wayland-client-core.h>
 #include <wayland-client-protocol.h>
@@ -345,8 +346,10 @@ static void osc_cb(struct tsm_vte *vte, const char *osc, size_t len,
                                 /* Reuse the oldest slot (0) and shift others */
                                 free_image_at_index(0);
                                 memmove(&term.images[0], &term.images[1],
-                                (max_images - 1) * sizeof(struct image));
+                                        (max_images - 1) * sizeof(struct image));
                                 target_idx = max_images - 1;
+                                /* CRITICAL: Clear the new slot so it doesn't hold stale data from the shift */
+                                memset(&term.images[target_idx], 0, sizeof(struct image));
                             }
 
                             if (target_idx < 0) {
@@ -412,6 +415,7 @@ static void osc_cb(struct tsm_vte *vte, const char *osc, size_t len,
             }
         }
     }
+    malloc_trim(0);
 }
 
 static void wcb(struct tsm_vte *vte, const char *u8, size_t len, void *data) {
@@ -1768,6 +1772,8 @@ static void setup_pty(char *argv[]) {
     } else if (pid == 0) {
         char *prog;
         setenv("TERM", "xterm-256color", 1);
+        /* for Yazi to use iTerm2 protocol */
+        setenv("TERM_PROGRAM", "WezTerm", 1);
         if (*argv) {
             execvp(*argv, argv);
             prog = *argv;
@@ -1786,16 +1792,21 @@ static void setup_pty(char *argv[]) {
     fcntl(term.master_fd, F_SETFL, O_NONBLOCK);
 }
 
+static void action_images_clear(void) {
+    for (int i = 0; i < term.num_images; i++) {
+        free_image_at_index(i);
+    }
+    term.num_images = 0;
+}
+
 static void action_reset(void) {
     tsm_vte_reset(term.vte);
-    if (term.num_images > 0)
-        free_image_at_index(0);
+    action_images_clear();
 }
 
 static void action_hard_reset(void) {
     tsm_vte_hard_reset(term.vte);
-    if (term.num_images > 0)
-        free_image_at_index(0);
+    action_images_clear();
     term.need_redraw = true;
 }
 

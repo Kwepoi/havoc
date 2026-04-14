@@ -729,9 +729,18 @@ static void do_collect(struct tsm_vte *vte, uint32_t data)
 
 static void do_osc_start(struct tsm_vte *vte)
 {
-	vte->osc_len = 0;
-	if (vte->osc_buf)
-		vte->osc_buf[0] = 0;
+    vte->osc_len = 0;
+    if (vte->osc_buf) {
+        /* CRITICAL FIX: Aggressively free the buffer to release base64
+           image strings so they don't permanently sit in RAM. */
+        if (vte->osc_alloc > 4096) {
+            free(vte->osc_buf);
+            vte->osc_buf = NULL;
+            vte->osc_alloc = 0;
+        } else {
+            vte->osc_buf[0] = '\0';
+        }
+    }
 }
 
 static void do_osc_collect(struct tsm_vte *vte, uint32_t data)
@@ -751,8 +760,18 @@ static void do_osc_collect(struct tsm_vte *vte, uint32_t data)
 
 static void do_osc_end(struct tsm_vte *vte)
 {
-	if (vte->osc_cb)
-		vte->osc_cb(vte, vte->osc_buf, vte->osc_len, vte->data);
+    if (vte->osc_cb)
+        vte->osc_cb(vte, vte->osc_buf, vte->osc_len, vte->data);
+
+    /* CRITICAL FIX: Immediately destroy the buffer after the callback.
+       Base64 payloads are huge. If we don't free this instantly, 
+       the terminal squats on the peak memory forever. */
+    if (vte->osc_alloc > 0) {
+        free(vte->osc_buf);
+        vte->osc_buf = NULL;
+        vte->osc_alloc = 0;
+        vte->osc_len = 0;
+    }
 }
 
 static void do_param(struct tsm_vte *vte, uint32_t data)
