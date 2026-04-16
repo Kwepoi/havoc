@@ -57,6 +57,8 @@ static struct {
     bool configured;
     bool need_redraw;
     bool can_redraw;
+    bool mouse_tracking;
+    int mouse_down_button;
     int resize;
 
     int master_fd;
@@ -161,7 +163,7 @@ static struct {
         char *ps_mime;
 
         int fd[2];
-        char buf[200];
+        char buf[8192];
         size_t len;
         bool active;
     } paste;
@@ -439,14 +441,22 @@ static void handle_tty(int ev) {
     int len = 0;
 
     if (ev & POLLIN) {
-        char data[256];
+        char data[257]; /* +1 for null terminator */
 
         term.need_redraw = true;
-        len = read(term.master_fd, data, sizeof(data));
+        len = read(term.master_fd, data, 256);
 
         if (len < 0) {
             error("could not read from pty");
-        } else {
+        } else if (len > 0) {
+            data[len] = '\0'; /* safe null termination for strstr */
+
+            /* Sniff for Neovim enabling/disabling the mouse */
+            if (strstr(data, "[?1000h") || strstr(data, "[?1002h") || strstr(data, "[?1006h"))
+                term.mouse_tracking = true;
+            if (strstr(data, "[?1000l") || strstr(data, "[?1002l") || strstr(data, "[?1006l"))
+                term.mouse_tracking = false;
+
             tsm_vte_input(term.vte, data, len);
         }
     }
@@ -670,13 +680,9 @@ static void end_paste(void) {
 
 static void handle_paste(int ev) {
     if (ev & POLLIN) {
-        uint32_t code;
-        ssize_t len;
-        char const *p = &term.paste.buf[0];
-
-        len = read(term.paste.fd[0], term.paste.buf + term.paste.len,
-                   sizeof term.paste.buf - term.paste.len);
-
+        char buf[8192];
+        ssize_t len = read(term.paste.fd[0], buf, sizeof(buf));
+        
         if (len <= 0) {
             end_paste();
             return;
@@ -685,16 +691,29 @@ static void handle_paste(int ev) {
         if (term.cfg.scroll_to_bottom_on_input)
             tsm_screen_sb_reset(term.screen);
 
-        term.need_redraw = true;
-        term.paste.len += len;
-        while (term.paste.len > 0) {
-            if (utf8_to_utf32(&p, &term.paste.len, &code)) {
-                memcpy(&term.paste.buf, p, term.paste.len);
-                break;
-            }
-            tsm_vte_handle_keyboard(term.vte, XKB_KEY_NoSymbol,
-                                    XKB_KEY_NoSymbol, 0, code);
+        /* Terminals expect \r instead of \n when pasting */
+        for (ssize_t i = 0; i < len; i++) {
+            if (buf[i] == '\n') buf[i] = '\r';
         }
+
+        /* Safely write to PTY, waiting for kernel buffer to drain if full */
+        if (term.master_fd >= 0) {
+            ssize_t written = 0;
+            while (written < len) {
+                ssize_t w = write(term.master_fd, buf + written, len - written);
+                if (w < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        struct pollfd pfd = { .fd = term.master_fd, .events = POLLOUT };
+                        poll(&pfd, 1, -1); /* Wait for PTY to be ready */
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+                written += w;
+            }
+        }
+        term.need_redraw = true;
     } else if (ev & POLLHUP) {
         end_paste();
     }
@@ -1403,10 +1422,28 @@ static void ptr_leave(void *data, struct wl_pointer *wl_pointer,
     cursor_unset();
 }
 
-static void ptr_motion(void *data, struct wl_pointer *wl_pointer, uint32_t time,
-                       wl_fixed_t x, wl_fixed_t y) {
+static void ptr_motion(void *data, struct wl_pointer *wl_pointer, uint32_t time, wl_fixed_t x, wl_fixed_t y) {
+    static int last_gx = -1, last_gy = -1;
     term.ptr_x = x;
     term.ptr_y = y;
+
+    /* Neovim drag tracking */
+    if (term.mouse_tracking && !(term.mods & TSM_SHIFT_MASK)) {
+        if (term.mouse_down_button >= 0) {
+            int gx = grid_x() + 1;
+            int gy = grid_y() + 1;
+            /* Only send event if grid cell changed (prevents PTY lag) */
+            if (gx != last_gx || gy != last_gy) {
+                last_gx = gx; last_gy = gy;
+                char seq[32];
+                int l = snprintf(seq, sizeof(seq), "\033[<%d;%d;%dM", term.mouse_down_button + 32, gx, gy);
+                write(term.master_fd, seq, l);
+            }
+        }
+        if (term.cursor.current == NULL && term.cursor.text)
+            cursor_set(term.cursor.text);
+        return;
+    }
 
     switch (term.selection) {
     case SS_ANCHORED:
@@ -1428,9 +1465,24 @@ static void ptr_motion(void *data, struct wl_pointer *wl_pointer, uint32_t time,
         cursor_set(term.cursor.text);
 }
 
-static void ptr_button(void *data, struct wl_pointer *wl_pointer,
-                       uint32_t serial, uint32_t time, uint32_t button,
-                       uint32_t state) {
+static void ptr_button(void *data, struct wl_pointer *wl_pointer, uint32_t serial, uint32_t time, uint32_t button, uint32_t state) {
+    /* If Neovim wants the mouse AND Shift is NOT held */
+    if (term.mouse_tracking && !(term.mods & TSM_SHIFT_MASK)) {
+        int b = -1;
+        if (button == 0x110) b = 0;      /* Left Click */
+        else if (button == 0x112) b = 1; /* Middle Click */
+        else if (button == 0x111) b = 2; /* Right Click */
+
+        if (b >= 0) {
+            term.mouse_down_button = (state == WL_POINTER_BUTTON_STATE_PRESSED) ? b : -1;
+            
+            char seq[32];
+            char is_press = (state == WL_POINTER_BUTTON_STATE_PRESSED) ? 'M' : 'm';
+            int l = snprintf(seq, sizeof(seq), "\033[<%d;%d;%d%c", b, grid_x() + 1, grid_y() + 1, is_press);
+            write(term.master_fd, seq, l);
+        }
+        return; /* Skip normal terminal selection */
+    }
     if (button == 0x110) {
         switch (state) {
         case WL_POINTER_BUTTON_STATE_PRESSED:
@@ -1481,12 +1533,20 @@ static void ptr_button(void *data, struct wl_pointer *wl_pointer,
         cursor_set(term.cursor.text);
 }
 
-static void ptr_axis(void *data, struct wl_pointer *wl_pointer, uint32_t time,
-                     uint32_t axis, wl_fixed_t value) {
+static void ptr_axis(void *data, struct wl_pointer *wl_pointer, uint32_t time, uint32_t axis, wl_fixed_t value) {
     int v = wl_fixed_to_double(value) / 3;
 
-    if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL)
+    if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL || v == 0)
         return;
+
+    /* Neovim scroll tracking */
+    if (term.mouse_tracking && !(term.mods & TSM_SHIFT_MASK)) {
+        int b = (v > 0) ? 65 : 64; /* 64 = up, 65 = down */
+        char seq[32];
+        int l = snprintf(seq, sizeof(seq), "\033[<%d;%d;%dM", b, grid_x() + 1, grid_y() + 1);
+        write(term.master_fd, seq, l);
+        return;
+    }
 
     if (v > 0)
         tsm_screen_sb_down(term.screen, v);
@@ -1774,6 +1834,7 @@ static void setup_pty(char *argv[]) {
         setenv("TERM", "xterm-256color", 1);
         /* for Yazi to use iTerm2 protocol */
         setenv("TERM_PROGRAM", "WezTerm", 1);
+        setenv("COLORTERM", "truecolor", 1);
         if (*argv) {
             execvp(*argv, argv);
             prog = *argv;

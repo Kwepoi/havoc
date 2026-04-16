@@ -38,6 +38,7 @@ struct font {
 	unsigned char *data;
 	size_t size;
 	bool mmapped;
+	bool is_valid;
 
 	int fontstart;
 
@@ -58,6 +59,7 @@ struct font {
 };
 
 static struct font font;
+static struct font font_fb;
 
 enum {
 	VMOVE = 1,
@@ -85,33 +87,36 @@ struct bitmap {
 #define read_byte(p) (*(uint8_t *)(p))
 #define read_char(p) (*(int8_t *)(p))
 
+static bool is_valid_ptr(const uint8_t *p, size_t len) {
+	if (font.is_valid && p >= font.data && p + len <= font.data + font.size) return true;
+	if (font_fb.is_valid && p >= font_fb.data && p + len <= font_fb.data + font_fb.size) return true;
+	return false;
+}
+
 static uint16_t read_ushort(const uint8_t *p)
 {
-	if (p < font.data || p + 1 > font.data + font.size - 1) {
-		fprintf(stderr, "font file is corrupt\n");
+	if (!is_valid_ptr(p, 2)) {
+		fprintf(stderr, "font file is corrupt or out of bounds\n");
 		return 0;
 	}
-
 	return (p[0] << 8) + p[1];
 }
 
 static int16_t read_short(const uint8_t *p)
 {
-	if (p < font.data || p + 1 > font.data + font.size - 1) {
-		fprintf(stderr, "font file is corrupt\n");
+	if (!is_valid_ptr(p, 2)) {
+		fprintf(stderr, "font file is corrupt or out of bounds\n");
 		return 0;
 	}
-
 	return (p[0] << 8) + p[1];
 }
 
 static uint32_t read_ulong(const uint8_t *p)
 {
-	if (p < font.data || p + 3 > font.data + font.size - 1) {
-		fprintf(stderr, "font file is corrupt\n");
+	if (!is_valid_ptr(p, 4)) {
+		fprintf(stderr, "font file is corrupt or out of bounds\n");
 		return 0;
 	}
-
 	return p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3];
 }
 
@@ -616,19 +621,6 @@ static int get_descent(struct font *f)
 static int get_linegap(struct font *f)
 {
 	return read_short(f->data + f->hhea + 8);
-}
-
-static void get_glyph_origin(struct font *f, int glyph, int *x, int *y)
-{
-	int g = glyph_offset(f, glyph);
-
-	if (g < 0) {
-		*x = 0, *y = 0;
-		return;
-	}
-
-	*x = floor(read_short(f->data + g + 2) * f->scale);
-	*y = floor(-read_short(f->data + g + 8) * f->scale);
 }
 
 struct hheap_chunk {
@@ -1457,13 +1449,30 @@ static unsigned char *lookup(struct node *n, uint32_t ch)
 	return NULL;
 }
 
+static short get_advance(struct font *f, int glyph)
+{
+	if (glyph < f->num_metrics)
+		return read_ushort(f->data + f->hmtx + 4 * glyph);
+	else
+		return read_ushort(f->data + f->hmtx + 4 * (f->num_metrics - 1));
+}
+
 unsigned char *new_glyph(uint32_t id, uint32_t c, int cwidth)
 {
-	struct vertex *vertices;
-	int xmin, ymin;
-	int glyph = find_index(&font, c);
-	float leftb = get_bearing(&font, glyph) * font.scale;
-	int vcount = glyph_shape(&font, glyph, &vertices);
+	struct vertex *vertices = NULL;
+	int xmin = 0, ymin = 0;
+	struct font *f_ptr = &font;
+	int glyph = find_index(f_ptr, c);
+
+	if (glyph == 0 && font_fb.is_valid) {
+		int fb_glyph = find_index(&font_fb, c);
+		if (fb_glyph != 0) {
+			f_ptr = &font_fb;
+			glyph = fb_glyph;
+		}
+	}
+
+	int vcount = glyph_shape(f_ptr, glyph, &vertices);
 	struct bitmap bm = {
 		font.width * cwidth,
 		font.height,
@@ -1472,10 +1481,32 @@ unsigned char *new_glyph(uint32_t id, uint32_t c, int cwidth)
 	};
 
 	bm.pixels = calloc(1, bm.w * bm.h);
+	if (!bm.pixels) {
+		if (vertices) free(vertices);
+		return NULL;
+	}
 
-	get_glyph_origin(&font, glyph, &xmin, &ymin);
-	render(&bm, 0.35f, vertices, vcount, font.scale, font.scale,
-	       leftb, font.ascent + ymin, xmin, ymin, 1);
+	if (vcount <= 0) {
+		if (vertices) free(vertices);
+		cache(&font.cache, id, bm.pixels);
+		return bm.pixels;
+	}
+
+	float draw_scale_x = f_ptr->scale;
+	float draw_scale_y = f_ptr->scale;
+	float shift_x = get_bearing(f_ptr, glyph) * f_ptr->scale;
+	float shift_y = f_ptr->ascent;
+
+	int g = glyph_offset(f_ptr, glyph);
+	if (g >= 0) {
+		xmin = floor(read_short(f_ptr->data + g + 2) * draw_scale_x);
+		ymin = floor(-read_short(f_ptr->data + g + 8) * draw_scale_y);
+	}
+	
+	shift_y += ymin;
+
+	render(&bm, 0.35f, vertices, vcount, draw_scale_x, draw_scale_y,
+	       shift_x, shift_y, xmin, ymin, 1);
 
 	free(vertices);
 
@@ -1496,72 +1527,60 @@ unsigned char *get_glyph(uint32_t id, uint32_t c, int cwidth)
 static int get_width(struct font *f)
 {
 	int i = find_index(f, 'W');
-	short advance;
-
-	if (i < f->num_metrics) {
-		advance = read_short(f->data + f->hmtx + 4 * i);
-	} else {
-		advance = read_short(f->data + f->hmtx);
-	}
-
-	return advance;
+	return get_advance(f, i);
 }
 
-static void open_font(char *path)
+static int open_font_file(struct font *f, const char *path)
 {
 	int fd;
 	struct stat st;
 
 	if (path == NULL || *path == '\0')
-		goto fb;
+		return -1;
 
 	fd = open(path, O_RDONLY);
-	if (fd < 0) {
-		fprintf(stderr, "could not open font file: %s\n",
-			strerror(errno));
-		goto err;
-	}
+	if (fd < 0)
+		return -1;
 
 	if (fstat(fd, &st) < 0) {
-		fprintf(stderr, "could not fstat font file: %s\n",
-			strerror(errno));
 		close(fd);
-		goto err;
+		return -1;
 	}
 
-	font.size = st.st_size;
-	font.data = mmap(NULL, font.size, PROT_READ, MAP_PRIVATE, fd, 0);
+	f->size = st.st_size;
+	f->data = mmap(NULL, f->size, PROT_READ, MAP_PRIVATE, fd, 0);
 	close(fd);
-	if (font.data == MAP_FAILED) {
-		fprintf(stderr, "could not mmap font file: %s\n",
-			strerror(errno));
-		goto err;
-	}
-	font.mmapped = true;
-	return;
+	if (f->data == MAP_FAILED)
+		return -1;
 
-err:
-	fprintf(stderr, "using fallback font\n");
-fb:
-	font.size = sizeof(fallback);
-	font.data = &fallback[0];
-	font.mmapped = false;
+	f->mmapped = true;
+	f->is_valid = true;
+	return 0;
 }
 
-static void close_font(void)
+static void close_font_file(struct font *f)
 {
-	if (font.mmapped)
-		munmap(font.data, font.size);
+	if (f->mmapped)
+		munmap(f->data, f->size);
+	f->is_valid = false;
 }
 
 int font_init(int size, char *path, int *w, int *h)
 {
 	int descent, linegap;
 
-	open_font(path);
+	font.is_valid = false;
+	if (open_font_file(&font, path) < 0) {
+		fprintf(stderr, "could not open font %s, using fallback array\n",
+          path ? path : "null");
+		font.size = sizeof(fallback);
+		font.data = (unsigned char*)&fallback[0];
+		font.mmapped = false;
+		font.is_valid = true;
+	}
 
 	if (setup(&font, 0) < 0) {
-		close_font();
+		close_font_file(&font);
 		return -1;
 	}
 
@@ -1583,11 +1602,38 @@ int font_init(int size, char *path, int *w, int *h)
 	*w = font.width;
 	*h = font.height;
 
+	/* Setup automatic Nerd Font fallback symbol integration */
+	font_fb.is_valid = false;
+	const char *fb_paths[] = {
+	  "/run/current-system/sw/share/X11/fonts/SymbolsNerdFont-Regular.ttf",
+	  "/run/current-system/sw/share/X11/fonts/SymbolsNerdFontMono-Regular.ttf",
+	  "/usr/share/fonts/TTF/SymbolsNerdFont-Regular.ttf",
+	  "/usr/share/fonts/nerd-fonts-complete/TTF/SymbolsNerdFont-Regular.ttf",
+      "/usr/share/fonts/SymbolsNerdFont-Regular.ttf",
+	  NULL
+	};
+
+	for (int i = 0; fb_paths[i]; ++i) {
+		if (open_font_file(&font_fb, fb_paths[i]) == 0) {
+			if (setup(&font_fb, 0) == 0) {
+				font_fb.num_metrics = read_ushort(font_fb.data + font_fb.hhea + 34);
+				int fb_descent = get_descent(&font_fb);
+				int fb_ascent = get_ascent(&font_fb);
+				font_fb.scale = (float)size / (fb_ascent - fb_descent);
+				font_fb.ascent = floor(font_fb.scale * fb_ascent);
+				break; /* successfully loaded a fallback! */
+			} else {
+				close_font_file(&font_fb);
+			}
+		}
+	}
+
 	return 0;
 }
 
 void font_deinit(void)
 {
 	delete_cache(font.cache);
-	close_font();
+	close_font_file(&font);
+	if (font_fb.is_valid) close_font_file(&font_fb);
 }
