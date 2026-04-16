@@ -367,31 +367,69 @@ static void osc_cb(struct tsm_vte *vte, const char *osc, size_t len,
                             int max_w = scr_w * term.cwidth;
                             int max_h = (scr_h - 2) * term.cheight;
 
+                            const char *p = file;
+                            int req_w = 0, req_h = 0;
+                            while (p && p < colon) {
+                                if (strncmp(p, "width=", 6) == 0) {
+                                    int val = atoi(p + 6);
+                                    if (val > 0) {
+                                        const char *end = strchr(p, ';');
+                                        if (!end || end > colon) end = colon;
+                                        bool is_px = false;
+                                        for (const char *c = p + 6; c < end - 1; c++) {
+                                            if (c[0] == 'p' && c[1] == 'x') is_px = true;
+                                        }
+                                        req_w = is_px ? val : (val * term.cwidth);
+                                    }
+                                } else if (strncmp(p, "height=", 7) == 0) {
+                                    int val = atoi(p + 7);
+                                    if (val > 0) {
+                                        const char *end = strchr(p, ';');
+                                        if (!end || end > colon) end = colon;
+                                        bool is_px = false;
+                                        for (const char *c = p + 7; c < end - 1; c++) {
+                                            if (c[0] == 'p' && c[1] == 'x') is_px = true;
+                                        }
+                                        req_h = is_px ? val : (val * term.cheight);
+                                    }
+                                }
+                                p = strchr(p, ';');
+                                if (p) p++;
+                            }
+
+                            if (req_w > 0 && req_h > 0) {
+                                target_w = req_w;
+                                target_h = (int)((long long)h * req_w / w);
+                                if (target_h > req_h) {
+                                    target_h = req_h;
+                                    target_w = (int)((long long)w * req_h / h);
+                                }
+                            } else if (req_w > 0) {
+                                target_w = req_w;
+                                target_h = (int)((long long)h * req_w / w);
+                            } else if (req_h > 0) {
+                                target_h = req_h;
+                                target_w = (int)((long long)w * req_h / h);
+                            }
+
                             if (target_w > max_w) {
-                                target_h = (int)((long long)target_h * max_w /
-                                                 target_w);
+                                target_h = (int)((long long)target_h * max_w / target_w);
                                 target_w = max_w;
                             }
                             if (target_h > max_h) {
-                                target_w = (int)((long long)target_w * max_h /
-                                                 target_h);
+                                target_w = (int)((long long)target_w * max_h / target_h);
                                 target_h = max_h;
                             }
 
-                            if (target_w <= 0)
-                                target_w = 1;
-                            if (target_h <= 0)
-                                target_h = 1;
+                            if (target_w <= 0) target_w = 1;
+                            if (target_h <= 0) target_h = 1;
 
-                            int cols =
-                                (target_w + term.cwidth - 1) / term.cwidth;
-                            int rows =
-                                (target_h + term.cheight - 1) / term.cheight;
+                            int cols = (target_w + term.cwidth - 1) / term.cwidth;
+                            int rows = (target_h + term.cheight - 1) / term.cheight;
 
-                            unsigned char *resized =
-                                malloc(target_w * target_h * 4);
+                            unsigned char *resized = malloc(target_w * target_h * 4);
                             if (resized) {
-                                stbir_resize_uint8_linear(
+                                stbir_resize_uint8_srgb(
                                     pixels, w, h, 0, resized, target_w,
                                     target_h, 0, STBIR_RGBA);
 
