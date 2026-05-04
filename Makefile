@@ -11,7 +11,7 @@ CDEFS = -DVERSION='$(VERSION)' -D_XOPEN_SOURCE=700 -D_GNU_SOURCE
 
 WAYLAND_PROTOCOLS_DIR != $(PKG_CONFIG) --variable=pkgdatadir wayland-protocols
 
-LIBRARIES = wayland-client wayland-cursor xkbcommon
+LIBRARIES = wayland-client wayland-cursor xkbcommon fontconfig
 PKG_CFLAGS != $(PKG_CONFIG) --cflags $(LIBRARIES)
 PKG_LIBS != $(PKG_CONFIG) --libs $(LIBRARIES)
 

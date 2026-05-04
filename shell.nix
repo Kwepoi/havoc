@@ -11,5 +11,6 @@ pkgs.mkShell {
     wayland
     wayland-protocols
     libxkbcommon
+    fontconfig
   ];
 }

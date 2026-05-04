@@ -775,7 +775,7 @@ static const struct wl_buffer_listener buffer_listener = {
 
 static int buffer_init(struct buffer *buf) {
     struct wl_shm_pool *pool;
-    char shm_name[14];
+    char shm_name[32];
     int fd, stride;
     int max = 100;
 
@@ -786,7 +786,7 @@ static int buffer_init(struct buffer *buf) {
 
     srand(time(NULL));
     do {
-        sprintf(shm_name, "/havoc-%d", rand() % 1000000);
+        snprintf(shm_name, sizeof(shm_name), "/havoc-%d", rand() % 1000000);
         fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0600);
     } while (fd < 0 && errno == EEXIST && --max);
 
